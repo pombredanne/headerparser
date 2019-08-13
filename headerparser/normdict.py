@@ -1,8 +1,12 @@
-import collections
-from   six    import iteritems, itervalues
+from   six    import PY2, iteritems, itervalues
 from   .types import lower
 
-class NormalizedDict(collections.MutableMapping):
+if PY2:
+    from collections     import Mapping, MutableMapping
+else:
+    from collections.abc import Mapping, MutableMapping
+
+class NormalizedDict(MutableMapping):
     """
     A generalization of a case-insensitive dictionary.  `NormalizedDict` takes
     a callable (the "normalizer") that is applied to any key passed to its
@@ -61,7 +65,7 @@ class NormalizedDict(collections.MutableMapping):
         if isinstance(other, NormalizedDict):
             if self.normalizer != other.normalizer or self.body != other.body:
                 return False
-        elif isinstance(other, collections.Mapping):
+        elif isinstance(other, Mapping):
             if self.body is not None:
                 return False
             other = NormalizedDict(other, normalizer=self.normalizer)
@@ -72,10 +76,10 @@ class NormalizedDict(collections.MutableMapping):
     def __ne__(self, other):
         return not (self == other)
 
-    def __repr__(self):  # pragma: no cover
-        return '{0.__class__.__module__}.{0.__class__.__name__}'\
-               '({1!r}, normalizer={0.normalizer!r}, body={0.body!r})'\
-               .format(self, dict(self))
+    def __repr__(self):
+        return '{0.__module__}.{0.__name__}'\
+               '({2!r}, normalizer={1.normalizer!r}, body={1.body!r})'\
+               .format(type(self), self, dict(self))
 
     def normalized(self):
         """
@@ -109,7 +113,7 @@ class NormalizedDict(collections.MutableMapping):
 
     def copy(self):
         """ Create a shallow copy of the mapping """
-        dup = self.__class__()
+        dup = type(self)()
         dup._data = self._data.copy()
         dup.normalizer = self.normalizer
         dup.body = self.body

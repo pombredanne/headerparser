@@ -1,5 +1,6 @@
+import re
 import pytest
-from   headerparser import NormalizedDict
+from   headerparser import NormalizedDict, lower
 
 def test_empty():
     nd = NormalizedDict()
@@ -7,6 +8,7 @@ def test_empty():
     assert nd.body is None
     assert len(nd) == 0
     assert not bool(nd)
+    assert nd.normalizer is lower
 
 def test_one():
     nd = NormalizedDict({"Foo": "bar"})
@@ -14,6 +16,7 @@ def test_one():
     assert nd.body is None
     assert len(nd) == 1
     assert bool(nd)
+    assert nd.normalizer is lower
 
 def test_get_cases():
     nd = NormalizedDict({"Foo": "bar"})
@@ -111,12 +114,12 @@ def test_neq_body():
     assert nd != nd2
 
 def test_neq_none():
-    assert NormalizedDict() != None
-    assert None != NormalizedDict()
+    assert NormalizedDict() != None  # noqa: E711
+    assert None != NormalizedDict()  # noqa: E711
 
 def test_neq_bool():
-    assert NormalizedDict() != False
-    assert False != NormalizedDict()
+    assert NormalizedDict() != False  # noqa: E712
+    assert False != NormalizedDict()  # noqa: E712
 
 def test_neq_int():
     assert NormalizedDict() != 42
@@ -171,3 +174,20 @@ def test_neq_normalizers_nonempty():
     nd2 = NormalizedDict({"Foo": "bar"}, normalizer=lambda x: x)
     assert dict(nd) == dict(nd2) == {"Foo": "bar"}
     assert nd != nd2
+
+def normdash(s):
+    return re.sub(r'[-_\s]+', '-', s.lower())
+
+def identity(s):
+    return s
+
+@pytest.mark.parametrize('data', [
+    {}, {'Foo': 'Bar'}, {'foo': 'Bar'}, {'FOO_BAR': 'BAZ'},
+])
+@pytest.mark.parametrize('normalizer', [None, lower, normdash, identity])
+@pytest.mark.parametrize('body', [None, 'Glarch.'])
+def test_repr(data, normalizer, body):
+    nd = NormalizedDict(data, body=body, normalizer=normalizer)
+    assert repr(nd) == 'headerparser.normdict.NormalizedDict'\
+                       '({!r}, normalizer={!r}, body={!r})'\
+                       .format(data, normalizer or lower, body)

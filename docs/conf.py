@@ -1,13 +1,8 @@
-from   __future__ import unicode_literals
-import os.path
-import sys
-
-sys.path.insert(0, os.path.abspath('..'))
-from   headerparser import __version__
+from headerparser import __version__
 
 project   = 'headerparser'
 author    = 'John T. Wodder II'
-copyright = '2017 John T. Wodder II'
+copyright = '2017-2019 John T. Wodder II'
 
 extensions = [
     'sphinx.ext.autodoc',
@@ -16,7 +11,10 @@ extensions = [
     'sphinx.ext.viewcode',
 ]
 
-autodoc_default_flags = ['members', 'undoc-members']
+autodoc_default_options = {
+    'members': None,
+    'undoc-members': None,
+}
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
@@ -34,6 +32,9 @@ pygments_style = 'sphinx'
 todo_include_todos = True
 
 html_theme = 'sphinx_rtd_theme'
+html_theme_options = {
+    "collapse_navigation": False,
+}
 html_last_updated_fmt = '%Y %b %d'
 html_show_sourcelink = True
 html_show_sphinx = True

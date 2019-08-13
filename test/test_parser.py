@@ -1,4 +1,5 @@
 import pytest
+from   six          import StringIO
 import headerparser
 from   headerparser import HeaderParser
 
@@ -111,6 +112,7 @@ def test_missing_required():
     parser.add_field('Baz', required=True)
     with pytest.raises(headerparser.MissingFieldError) as excinfo:
         parser.parse_string('Foo: red\nBar: green\n')
+    assert str(excinfo.value) == "Required header field 'Baz' is not present"
     assert excinfo.value.name == 'Baz'
 
 def test_present_default():
@@ -170,6 +172,7 @@ def test_bad_multiple():
     parser.add_field('Bar')
     with pytest.raises(headerparser.DuplicateFieldError) as excinfo:
         parser.parse_string('Foo: red\nFOO: magenta\nBar: green\nBar: lime\n')
+    assert str(excinfo.value) == "Header field 'Bar' occurs more than once"
     assert excinfo.value.name == 'Bar'
 
 def test_default_multiple():
@@ -218,6 +221,7 @@ def test_missing_required_multiple():
     parser.add_field('Bar')
     with pytest.raises(headerparser.MissingFieldError) as excinfo:
         parser.parse_string('Bar: green\n')
+    assert str(excinfo.value) == "Required header field 'Foo' is not present"
     assert excinfo.value.name == 'Foo'
 
 def test_unknown():
@@ -227,6 +231,7 @@ def test_unknown():
     parser.add_field('Baz')
     with pytest.raises(headerparser.UnknownFieldError) as excinfo:
         parser.parse_string('Foo: red\nBar: green\nQuux: blue\n')
+    assert str(excinfo.value) == "Unknown header field 'Quux'"
     assert excinfo.value.name == 'Quux'
 
 def test_empty_input():
@@ -285,4 +290,75 @@ def test_unfold():
     }
     assert msg.body is None
 
-### unknown + missing required
+def test_space_in_name():
+    parser = HeaderParser()
+    parser.add_field('Key Name')
+    parser.add_field('Bar')
+    parser.add_field('Baz')
+    msg = parser.parse_string('key name: red\nBar: green\nBaz: blue\n')
+    assert dict(msg) == {'Key Name': 'red', 'Bar': 'green', 'Baz': 'blue'}
+    assert msg.body is None
+
+def test_scan_opts_passed(mocker):
+    import headerparser.parser
+    mocker.patch(
+        'headerparser.parser.scan_string',
+        wraps=headerparser.parser.scan_string,
+    )
+    parser = HeaderParser(
+        separator_regex=r'\s*:\s*',
+        skip_leading_newlines=True,
+    )
+    parser.add_field('Foo')
+    parser.add_field('Bar')
+    parser.add_field('Baz')
+    parser.parse_string('Foo: red\nBar: green\nBaz: blue\n')
+    headerparser.parser.scan_string.assert_called_with(
+        'Foo: red\nBar: green\nBaz: blue\n',
+        separator_regex=r'\s*:\s*',
+        skip_leading_newlines=True,
+    )
+
+def test_deprecated_parse_lines():
+    parser = HeaderParser()
+    parser.add_field('Foo')
+    parser.add_field('Bar')
+    parser.add_field('Baz')
+    INPUT = 'Foo: red\nBar: green\nBaz: blue\n'.splitlines(True)
+    with pytest.warns(DeprecationWarning):
+        msg = parser.parse_lines(INPUT)
+    assert msg == parser.parse(INPUT)
+
+def test_deprecated_parse_file():
+    parser = HeaderParser()
+    parser.add_field('Foo')
+    parser.add_field('Bar')
+    parser.add_field('Baz')
+    INPUT = StringIO('Foo: red\nBar: green\nBaz: blue\n')
+    with pytest.warns(DeprecationWarning):
+        msg = parser.parse_file(INPUT)
+    INPUT.seek(0)
+    assert msg == parser.parse(INPUT)
+
+def test_body_twice():
+    parser = HeaderParser()
+    parser.add_field('Foo')
+    parser.add_field('Bar')
+    parser.add_field('Baz')
+    with pytest.raises(ValueError) as excinfo:
+        parser.parse_stream([
+            ('Foo', 'red'),
+            ('Bar', 'green'),
+            ('Baz', 'blue'),
+            (None, 'Body #1'),
+            (None, 'Body #2'),
+        ])
+    assert str(excinfo.value) == 'Body appears twice in input'
+
+@pytest.mark.parametrize('name', [42, None, 3.14, True, ['B', 'a', 'r']])
+def test_nonstr_field_name(name):
+    parser = HeaderParser()
+    parser.add_field('Foo')
+    with pytest.raises(TypeError) as excinfo:
+        parser.add_field(name)
+    assert str(excinfo.value) == 'field names must be strings'

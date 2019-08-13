@@ -1,7 +1,8 @@
 import pytest
 from   headerparser import NormalizedDict
 
-def identity(s): return s
+def identity(s):
+    return s
 
 def test_empty():
     nd = NormalizedDict(normalizer=identity)
@@ -9,6 +10,7 @@ def test_empty():
     assert nd.body is None
     assert len(nd) == 0
     assert not bool(nd)
+    assert nd.normalizer is identity
 
 def test_one():
     nd = NormalizedDict({"Foo": "bar"}, normalizer=identity)
@@ -16,6 +18,7 @@ def test_one():
     assert nd.body is None
     assert len(nd) == 1
     assert bool(nd)
+    assert nd.normalizer is identity
 
 def test_get_cases():
     nd = NormalizedDict({"Foo": "bar"}, normalizer=identity)

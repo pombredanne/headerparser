@@ -1,45 +1,72 @@
+from   warnings  import warn
 from   six       import itervalues, string_types
 from   .         import errors
 from   .normdict import NormalizedDict
-from   .scanner  import scan_file, scan_lines, scan_string
-from   .types    import lower
-from   .util     import unfold
+from   .scanner  import scan, scan_string, scan_stanzas, scan_stanzas_string, \
+                        scan_next_stanza, scan_next_stanza_string
+from   .types    import lower, unfold
 
 class HeaderParser(object):
     """
     A parser for RFC 822-style header sections.  Define the fields the parser
-    should recognize with the `add_field` method, configure handling of
-    unrecognized fields with `add_additional`, and then parse input with
-    `parse_file` or `parse_string`.
+    should recognize with the `add_field()` method, configure handling of
+    unrecognized fields with `add_additional()`, and then parse input with
+    `parse()` or another `!parse_*()` method.
 
     :param callable normalizer: By default, the parser will consider two field
         names to be equal iff their lowercased forms are equal.  This can be
         overridden by setting ``normalizer`` to a custom callable that takes a
         field name and returns a "normalized" name for use in equality testing.
         The normalizer will also be used when looking up keys in the
-        `NormalizedDict` instances returned by the parser's ``parse_*``
+        `NormalizedDict` instances returned by the parser's `!parse_*()`
         methods.
 
     :param bool body: whether the parser should allow or forbid a body after
         the header section; `True` means a body is required, `False` means a
-        body is prohibited, and `None` means a body is optional
+        body is prohibited, and `None` (the default) means a body is optional
+
+    :param kwargs: :ref:`scanner options <scan_opts>`
     """
 
-    def __init__(self, normalizer=None, body=None):
-        self.normalizer = normalizer or lower
-        self.body = body
-        self.fielddefs = dict()
-        self.dests = set()
-        self.additional = None
-        self.custom_dests = False
+    def __init__(self, normalizer=None, body=None, **kwargs):
+        #: The ``normalizer`` argument passed to the constructor, or `lower` if
+        #: no normalizer was supplied
+        self._normalizer = normalizer or lower
+        #: The ``body`` argument passed to the constructor
+        self._body = body
+        #: Scanner options
+        self._scan_opts = kwargs
+        #: A mapping from normalized field names to `NamedField` instances
+        self._fielddefs = dict()
+        #: The set of all normalized ``dest`` values for all named fields
+        #: defined so far
+        self._dests = set()
+        #: If additional fields are enabled, this is the `FieldDef` instance
+        #: used to process them; otherwise, it is `None`.
+        self._additional = None
+        #: Whether any fields with custom ``dest`` values have been defined,
+        #: thereby precluding `add_additional()`
+        self._custom_dests = False
+
+    def __eq__(self, other):
+        if type(self) is type(other):
+            return vars(self) == vars(other)
+        else:
+            return NotImplemented
+
+    def __ne__(self, other):
+        return not (self == other)
 
     def add_field(self, name, *altnames, **kwargs):
         """
         Define a header field for the parser to parse.  During parsing, if a
-        field is encountered whose name (*modulo* normalization) equals
-        ``name`` or is in ``altnames``, the field's value will be processed
-        according to the options in ``**kwargs``.  (If no options are
+        field is encountered whose name (*modulo* normalization) equals either
+        ``name`` or one of the ``altnames``, the field's value will be
+        processed according to the options in ``**kwargs``.  (If no options are
         specified, the value will just be stored in the result dictionary.)
+
+        .. versionadded:: 0.2.0
+            ``action`` argument added
 
         :param string name: the primary name for the field, used in error
             messages and as the default value of ``dest``
@@ -48,8 +75,8 @@ class HeaderParser(object):
 
         :param dest: The key in the result dictionary in which the field's
             value(s) will be stored; defaults to ``name``.  When additional
-            headers are enabled (see `add_additional`), ``dest`` can only equal
-            one of the field's names.
+            headers are enabled (see `add_additional`), ``dest`` must equal
+            (after normalization) one of the field's names.
 
         :param bool required: If `True` (default `False`), the ``parse_*``
             methods will raise a `~headerparser.errors.MissingFieldError` if
@@ -59,8 +86,15 @@ class HeaderParser(object):
             present in the input.  If no default value is specified, the field
             will be omitted from the result dictionary if it is not present in
             the input.  ``default`` cannot be set when the field is required.
-            ``type`` and ``unfold`` will not be applied to the default value,
-            and the default value need not belong to ``choices``.
+            ``type``, ``unfold``, and ``action`` will not be applied to the
+            default value, and the default value need not belong to
+            ``choices``.
+
+        :param bool multiple: If `True`, the header field will be allowed to
+            occur more than once in the input, and all of the field's values
+            will be stored in a list.  If `False` (the default), a
+            `~headerparser.errors.DuplicateFieldError` will be raised if the
+            field occurs more than once in the input.
 
         :param bool unfold: If `True` (default `False`), the field value will
             be "unfolded" (i.e., line breaks will be removed and whitespace
@@ -76,11 +110,14 @@ class HeaderParser(object):
             applying ``type``) or else an
             `~headerparser.errors.InvalidChoiceError` is raised.
 
-        :param bool multiple: If `True`, the header field will be allowed to
-            occur more than once in the input, and all of the field's values
-            will be stored in a list.  If `False` (the default), a
-            `~headerparser.errors.DuplicateFieldError` will be raised if the
-            field occurs more than once in the input.
+        :param callable action: A callable to invoke whenever the field is
+            encountered in the input.  The callable will be passed the current
+            dictionary of header fields, the field's ``name``, and the field's
+            value (after processing with ``type`` and ``unfold`` and checking
+            against ``choices``).  The callable replaces the default behavior
+            of storing the field's values in the result dictionary, and so the
+            callable must explicitly store the values if desired.  When
+            ``action`` is defined for a field, ``dest`` cannot be.
 
         :return: `None`
         :raises ValueError:
@@ -90,27 +127,30 @@ class HeaderParser(object):
               is enabled
             - if ``default`` is defined and ``required`` is true
             - if ``choices`` is an empty sequence
+            - if both ``dest`` and ``action`` are defined
         :raises TypeError: if ``name`` or one of the ``altnames`` is not a
             string
         """
 
+        if 'action' in kwargs and 'dest' in kwargs:
+            raise ValueError('`action` and `dest` are mutually exclusive')
         kwargs.setdefault('dest', name)
         hd = NamedField(name=name, **kwargs)
-        normed = set(map(self.normalizer, (name,) + altnames))
+        normed = set(map(self._normalizer, (name,) + altnames))
         # Error before modifying anything:
-        redefs = [n for n in self.fielddefs if n in normed]
+        redefs = [n for n in self._fielddefs if n in normed]
         if redefs:
             raise ValueError('field defined more than once: ' + repr(redefs[0]))
-        if self.normalizer(hd.dest) in self.dests:
+        if self._normalizer(hd.dest) in self._dests:
             raise ValueError('destination defined more than once: '
                              + repr(hd.dest))
-        if self.normalizer(hd.dest) not in normed:
-            if self.additional is not None:
+        if self._normalizer(hd.dest) not in normed:
+            if self._additional is not None:
                 raise ValueError('add_additional and `dest` are mutually exclusive')
-            self.custom_dests = True
+            self._custom_dests = True
         for n in normed:
-            self.fielddefs[n] = hd
-        self.dests.add(self.normalizer(hd.dest))
+            self._fielddefs[n] = hd
+        self._dests.add(self._normalizer(hd.dest))
 
     def add_additional(self, enable=True, **kwargs):
         """
@@ -132,10 +172,19 @@ class HeaderParser(object):
         are the same after normalization.  Customization of the dictionary key
         and field name can only be done through `add_field`.
 
+        .. versionadded:: 0.2.0
+            ``action`` argument added
+
         :param bool enable: whether the parser should accept input fields that
             were not registered with `add_field`; setting this to `False`
             disables additional fields and restores the parser's default
             behavior
+
+        :param bool multiple: If `True`, each additional header field will be
+            allowed to occur more than once in the input, and each field's
+            values will be stored in a list.  If `False` (the default), a
+            `~headerparser.errors.DuplicateFieldError` will be raised if an
+            additional field occurs more than once in the input.
 
         :param bool unfold: If `True` (default `False`), additional field
             values will be "unfolded" (i.e., line breaks will be removed and
@@ -151,11 +200,13 @@ class HeaderParser(object):
             applying ``type``) or else an
             `~headerparser.errors.InvalidChoiceError` is raised.
 
-        :param bool multiple: If `True`, each additional header field will be
-            allowed to occur more than once in the input, and each field's
-            values will be stored in a list.  If `False` (the default), a
-            `~headerparser.errors.DuplicateFieldError` will be raised if an
-            additional field occurs more than once in the input.
+        :param callable action: A callable to invoke whenever the field is
+            encountered in the input.  The callable will be passed the current
+            dictionary of header fields, the field's name, and the field's
+            value (after processing with ``type`` and ``unfold`` and checking
+            against ``choices``).  The callable replaces the default behavior
+            of storing the field's values in the result dictionary, and so the
+            callable must explicitly store the values if desired.
 
         :return: `None`
         :raises ValueError:
@@ -164,18 +215,18 @@ class HeaderParser(object):
             - if ``choices`` is an empty sequence
         """
         if enable:
-            if self.custom_dests:
+            if self._custom_dests:
                 raise ValueError('add_additional and `dest` are mutually exclusive')
-            self.additional = FieldDef(**kwargs)
+            self._additional = FieldDef(**kwargs)
         else:
-            self.additional = None
+            self._additional = None
 
     def parse_stream(self, fields):
         """
-        Process a sequence of ``(name, value)`` pairs as returned by
-        `scan_lines()` and return a dictionary of header fields (possibly with
-        body attached).  This is a low-level method that you will usually not
-        need to call.
+        Process a sequence of ``(name, value)`` pairs as returned by `scan()`
+        or `scan_string()` and return a dictionary of header fields (possibly
+        with body attached).  This is a low-level method that you will usually
+        not need to call.
 
         :param fields: a sequence of ``(name, value)`` pairs representing the
             input fields
@@ -183,38 +234,67 @@ class HeaderParser(object):
         :rtype: NormalizedDict
         :raises ParserError: if the input fields do not conform to the field
             definitions declared with `add_field` and `add_additional`
+        :raises ValueError: if the input contains more than one body pair
         """
-        data = NormalizedDict(normalizer=self.normalizer)
+        data = NormalizedDict(normalizer=self._normalizer)
+        fields_seen = set()
+        body_seen = False
         for k,v in fields:
             if k is None:
-                assert data.body is None
-                if self.body is not None and not self.body:
+                if body_seen:
+                    raise ValueError('Body appears twice in input')
+                if self._body is not None and not self._body:
                     raise errors.BodyNotAllowedError()
                 data.body = v
+                body_seen = True
             else:
                 try:
-                    hd = self.fielddefs[self.normalizer(k)]
+                    hd = self._fielddefs[self._normalizer(k)]
                 except KeyError:
-                    if self.additional is not None:
-                        hd = self.additional
+                    if self._additional is not None:
+                        hd = self._additional
                     else:
                         raise errors.UnknownFieldError(k)
+                else:
+                    fields_seen.add(hd.name)
                 hd.process(data, k, v)
-        for hd in itervalues(self.fielddefs):
-            if hd.dest not in data:
+        for hd in itervalues(self._fielddefs):
+            if hd.name not in fields_seen:
                 if hd.required:
                     raise errors.MissingFieldError(hd.name)
                 elif hasattr(hd, 'default'):
                     data[hd.dest] = hd.default
-        if self.body and data.body is None:
+        if self._body and not body_seen:
             raise errors.MissingBodyError()
         return data
+
+    def parse(self, iterable):
+        """
+        .. versionadded:: 0.4.0
+
+        Parse an RFC 822-style header field section (possibly followed by a
+        message body) from the contents of the given filehandle or sequence of
+        lines and return a dictionary of the header fields (possibly with body
+        attached).  If ``iterable`` is an iterable of `str`, newlines will be
+        appended to lines in multiline header fields where not already present
+        but will not be inserted where missing inside the body.
+
+        :param iterable: a text-file-like object or iterable of lines to parse
+        :rtype: NormalizedDict
+        :raises ParserError: if the input fields do not conform to the field
+            definitions declared with `add_field` and `add_additional`
+        :raises ScannerError: if the header section is malformed
+        """
+        return self.parse_stream(scan(iterable, **self._scan_opts))
 
     def parse_file(self, fp):
         """
         Parse an RFC 822-style header field section (possibly followed by a
         message body) from the contents of the given filehandle and return a
         dictionary of the header fields (possibly with body attached)
+
+        .. deprecated:: 0.4.0
+            Use `parse()` instead.
 
         :param fp: the file to parse
         :type fp: file-like object
@@ -223,7 +303,12 @@ class HeaderParser(object):
             definitions declared with `add_field` and `add_additional`
         :raises ScannerError: if the header section is malformed
         """
-        return self.parse_stream(scan_file(fp))
+        warn(
+            'HeaderParser.parse_file() is deprecated.'
+            '  Use the parse() method instead.',
+            DeprecationWarning,
+        )
+        return self.parse_stream(scan(fp, **self._scan_opts))
 
     def parse_lines(self, iterable):
         """
@@ -233,6 +318,9 @@ class HeaderParser(object):
         inserted where not already present in multiline header fields but will
         not be inserted inside the body.
 
+        .. deprecated:: 0.4.0
+            Use `parse()` instead.
+
         :param iterable: a sequence of lines comprising the text to parse
         :type iterable: iterable of strings
         :rtype: NormalizedDict
@@ -240,7 +328,12 @@ class HeaderParser(object):
             definitions declared with `add_field` and `add_additional`
         :raises ScannerError: if the header section is malformed
         """
-        return self.parse_stream(scan_lines(iterable))
+        warn(
+            'HeaderParser.parse_lines() is deprecated.'
+            '  Use the parse() method instead.',
+            DeprecationWarning,
+        )
+        return self.parse_stream(scan(iterable, **self._scan_opts))
 
     def parse_string(self, s):
         """
@@ -254,11 +347,110 @@ class HeaderParser(object):
             definitions declared with `add_field` and `add_additional`
         :raises ScannerError: if the header section is malformed
         """
-        return self.parse_stream(scan_string(s))
+        return self.parse_stream(scan_string(s, **self._scan_opts))
+
+    def parse_stanzas(self, iterable):
+        """
+        .. versionadded:: 0.4.0
+
+        Parse zero or more stanzas of RFC 822-style header fields from the
+        given filehandle or sequence of lines and return a generator of
+        dictionaries of header fields.
+
+        All of the input is treated as header sections, not message bodies; as
+        a result, calling this method when ``body`` is true will produce a
+        `MissingBodyError`.
+
+        :param iterable: a text-file-like object or iterable of lines to parse
+        :rtype: generator of `NormalizedDict`
+        :raises ParserError: if the input fields do not conform to the field
+            definitions declared with `add_field` and `add_additional`
+        :raises ScannerError: if a header section is malformed
+        """
+        return self.parse_stanzas_stream(
+            scan_stanzas(iterable, **self._scan_opts)
+        )
+
+    def parse_stanzas_string(self, s):
+        """
+        .. versionadded:: 0.4.0
+
+        Parse zero or more stanzas of RFC 822-style header fields from the
+        given string and return a generator of dictionaries of header fields.
+
+        All of the input is treated as header sections, not message bodies; as
+        a result, calling this method when ``body`` is true will produce a
+        `MissingBodyError`.
+
+        :param string s: the text to parse
+        :rtype: generator of `NormalizedDict`
+        :raises ParserError: if the input fields do not conform to the field
+            definitions declared with `add_field` and `add_additional`
+        :raises ScannerError: if a header section is malformed
+        """
+        return self.parse_stanzas_stream(
+            scan_stanzas_string(s, **self._scan_opts)
+        )
+
+    def parse_stanzas_stream(self, fields):
+        """
+        .. versionadded:: 0.4.0
+
+        Parse an iterable of iterables of ``(name, value)`` pairs as returned
+        by `scan_stanzas()` or `scan_stanzas_string()` and return a generator
+        of dictionaries of header fields.  This is a low-level method that you
+        will usually not need to call.
+
+        :param fields: an iterable of iterables of pairs of strings
+        :rtype: generator of `NormalizedDict`
+        :raises ParserError: if the input fields do not conform to the field
+            definitions declared with `add_field` and `add_additional`
+        :raises ScannerError: if a header section is malformed
+        """
+        for stanza in fields:
+            yield self.parse_stream(stanza)
+
+    def parse_next_stanza(self, iterator):
+        """
+        .. versionadded:: 0.4.0
+
+        Parse a RFC 822-style header field section from the contents of the
+        given filehandle or iterator of lines and return a dictionary of the
+        header fields.  Input processing stops at the end of the header
+        section, leaving the rest of the iterator unconsumed.  As a message
+        body is not consumed, calling this method when ``body`` is true will
+        produce a `MissingBodyError`.
+
+        :param iterator: a text-file-like object or iterator of lines to parse
+        :rtype: NormalizedDict
+        :raises ParserError: if the input fields do not conform to the field
+            definitions declared with `add_field` and `add_additional`
+        :raises ScannerError: if a header section is malformed
+        """
+        return self.parse_stream(scan_next_stanza(iterator, **self._scan_opts))
+
+    def parse_next_stanza_string(self, s):
+        """
+        .. versionadded:: 0.4.0
+
+        Parse a RFC 822-style header field section from the given string and
+        return a pair of a dictionary of the header fields and the rest of the
+        string.  As a message body is not consumed, calling this method when
+        ``body`` is true will produce a `MissingBodyError`.
+
+        :param string s: the text to parse
+        :rtype: pair of `NormalizedDict` and a string
+        :raises ParserError: if the input fields do not conform to the field
+            definitions declared with `add_field` and `add_additional`
+        :raises ScannerError: if a header section is malformed
+        """
+        fields, extra = scan_next_stanza_string(s, **self._scan_opts)
+        return (self.parse_stream(fields), extra)
 
 
 class FieldDef(object):
-    def __init__(self, type=None, multiple=False, unfold=False, choices=None):
+    def __init__(self, type=None, multiple=False, unfold=False, choices=None,
+                       action=None):
         self.type = type
         self.multiple = bool(multiple)
         self.unfold = bool(unfold)
@@ -267,6 +459,16 @@ class FieldDef(object):
             if not choices:
                 raise ValueError('empty list supplied for choices')
         self.choices = choices
+        self.action = action
+
+    def __eq__(self, other):
+        if type(self) is type(other):
+            return vars(self) == vars(other)
+        else:  # pragma: no cover
+            return NotImplemented
+
+    def __ne__(self, other):  # pragma: no cover
+        return not (self == other)
 
     def _process(self, data, name, dest, value):
         if self.unfold:
@@ -280,7 +482,9 @@ class FieldDef(object):
                 raise errors.FieldTypeError(name, value, e)
         if self.choices is not None and value not in self.choices:
             raise errors.InvalidChoiceError(name, value)
-        if self.multiple:
+        if self.action is not None:
+            self.action(data, name, value)
+        elif self.multiple:
             data.setdefault(dest, []).append(value)
         elif dest in data:
             raise errors.DuplicateFieldError(name)
